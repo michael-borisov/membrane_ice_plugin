@@ -252,17 +252,9 @@ defmodule Membrane.ICE.Connector do
   def handle_info({:component_state_ready, stream_id, component_id}, state) do
     Membrane.Logger.debug("Component #{component_id} READY")
 
-    %State{
-      parent: parent,
-      ice: ice,
-      handshakes: handshakes,
-      handshake_module: handshake_module
-    } = state
+    {hsk_state, hsk_status, hsk_data} = Map.get(state.handshakes, component_id)
 
-    {handshake_state, handshake_status, handshake_data} = Map.get(handshakes, component_id)
-
-    new_connections = MapSet.put(state.connections, component_id)
-    new_state = %State{state | connections: new_connections}
+    state = put_in(state.connections, component_id)
 
     if handshake_status != :finished do
       Membrane.Logger.debug("Checking for cached handshake packets")
@@ -272,61 +264,36 @@ defmodule Membrane.ICE.Connector do
         Membrane.Logger.debug("Nothing to be sent for component: #{component_id}")
       else
         Membrane.Logger.debug("Sending cached handshake packets for component: #{component_id}")
-        ExLibnice.send_payload(ice, stream_id, component_id, cached_packets)
+        ExLibnice.send_payload(state.ice, stream_id, component_id, cached_packets)
       end
 
-      res = handshake_module.connection_ready(handshake_state)
-
-      {{finished?, handshake_data}, new_state} =
-        parse_result(res, ice, stream_id, component_id, handshakes, handshake_state, new_state)
-
-      if finished? do
-        msg = {:component_ready, stream_id, component_id, handshake_data}
-        send(parent, msg)
-        {:noreply, new_state}
-      else
-        {:noreply, new_state}
-      end
-    else
-      msg = {:component_ready, stream_id, component_id, handshake_data}
-      send(parent, msg)
-      {:noreply, new_state}
+      handshake_module.connection_ready(handshake_state)
     end
+
+    msg = {:component_ready, stream_id, component_id}
+    send(state.parent, msg)
+    {:noreply, new_state}
   end
 
   @impl true
   def handle_info({:ice_payload, stream_id, component_id, payload}, state) do
-    %State{
-      parent: parent,
-      ice: ice,
-      handshakes: handshakes,
-      handshake_module: handshake_module
-    } = state
-
-    {handshake_state, handshake_status, _handshake_data} = Map.get(handshakes, component_id)
-
-    if handshake_status != :finished do
-      res = handshake_module.recv_from_peer(handshake_state, payload)
-
-      {{finished?, handshake_data}, new_state} =
-        parse_result(res, ice, stream_id, component_id, handshakes, handshake_state, state)
-
-      if finished? do
-        send(parent, {:handshake_data, component_id, handshake_data})
-      end
-
-      if finished? and MapSet.member?(state.connections, component_id) do
-        msg = {:component_ready, stream_id, component_id, handshake_data}
-        send(parent, msg)
-        {:noreply, new_state}
-      else
-        {:noreply, new_state}
-      end
+    if state.handshake_module.is_handshake_packet(payload) do
+      {hsk_state, _hsk_status, _hsk_data} = Map.get(state.handshakes, component_id)
+      state.handshake_module.process(hsk_state, payload)
     else
       msg = {:ice_payload, component_id, payload}
-      send(parent, msg)
-      {:noreply, state}
+      send(state.parent, msg)
     end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:handshake_packets, data}, state) do
+    state = send_or_cache(data, state)
+  end
+
+  def handle_info({:handshake_finished, data}, state) do
+    send(parent, {:handshake_data, component_id, handshake_data})
   end
 
   defp add_stream(state) do
@@ -390,54 +357,5 @@ defmodule Membrane.ICE.Connector do
         relay_type
       )
     )
-  end
-
-  @spec parse_result(
-          res ::
-            :ok
-            | {:finished_with_packets, handshake_data :: State.handshake_data(),
-               packets :: binary()}
-            | {:finished, handshake_data :: State.handshake_data()},
-          ice :: pid(),
-          stream_id :: non_neg_integer(),
-          component_id :: State.component_id(),
-          handshakes :: State.handshakes(),
-          handshake_status :: State.handshake_status(),
-          state :: State.t()
-        ) ::
-          {{finished? :: bool(), handshake_data :: State.handshake_data()},
-           new_state :: State.t()}
-  defp parse_result(res, ice, stream_id, component_id, handshakes, handshake_status, state) do
-    case res do
-      :ok ->
-        {{false, nil}, state}
-
-      {:ok, packets} ->
-        if MapSet.member?(state.connections, component_id) do
-          ExLibnice.send_payload(ice, stream_id, component_id, packets)
-          {{false, nil}, state}
-        else
-          cached_handshake_packets =
-            Map.put(state.cached_handshake_packets, component_id, packets)
-
-          {{false, nil}, %State{state | cached_handshake_packets: cached_handshake_packets}}
-        end
-
-      {:finished, handshake_data} ->
-        handshakes =
-          Map.put(handshakes, component_id, {handshake_status, :finished, handshake_data})
-
-        new_state = %State{state | handshakes: handshakes}
-        {{true, handshake_data}, new_state}
-
-      {:finished, handshake_data, packets} ->
-        ExLibnice.send_payload(ice, stream_id, component_id, packets)
-
-        handshakes =
-          Map.put(handshakes, component_id, {handshake_status, :finished, handshake_data})
-
-        new_state = %State{state | handshakes: handshakes}
-        {{true, handshake_data}, new_state}
-    end
   end
 end

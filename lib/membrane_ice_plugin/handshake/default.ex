@@ -20,4 +20,7 @@ defmodule Membrane.ICE.Handshake.Default do
   def recv_from_peer(_state, _data) do
     {:finished, nil}
   end
+
+  @impl true
+  def is_handshake_packet(_state, _data), do: false
 end
